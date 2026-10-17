@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A JSON shape is not yet an application value. This is the second promise.
+//// Decoders inspect the closed Json family and produce checked values, never
+//// reinterpret a foreign tuple as a class. Required fields and array positions
+//// keep their full paths. Objects retain the parser's first-key-wins lookup;
+//// optional fields distinguish absence from a present null value.
+////
+//// ```pooka
+//// class Person(name: String, age: Int)
+//// let person = decode.map2(decode.field("name", decode.string()), decode.field("age", decode.int()), Person)
+//// let assert Ok(value) = decode.read("{\"name\":\"Ada\",\"age\":3}", person)
+//// ```
+
+module decode
+
+import pooka/json
+import pooka/list as lists
+import pooka/int as integers
+import pooka/string as strings
+
+/// The address of a shape mismatch, from the outermost field to the innermost item.
+class DecodeError(path: List(String), expected: String, found: String)
+
+/// Parsing and application decoding are different failures and remain distinct.
+class ReadError {}
+
+class Syntax(error: json.JsonError) is ReadError
+
+class Shape(errors: List(DecodeError)) is ReadError
+
+/// A reusable, checked recipe over Json values.
+class Decoder(a) {
+  let _read: fn(json.Json) -> Result(a, List(DecodeError))
+
+  new(read: fn(json.Json) -> Result(a, List(DecodeError))) {
+    self._read = read
+  }
+
+  /// Decode a previously parsed value without reading the source text again.
+  run(value: json.Json) -> Result(a, List(DecodeError)) {
+    _read(value)
+  }
+
+  /// Transform a checked result. The error branch leaves the callback asleep.
+  map(change: fn(a) -> b) -> Decoder(b) {
+    Decoder(fn(value) {
+      let found = _read(value)?
+      Ok(change(found))
+    })
+  }
+
+  /// Select another recipe using a checked discriminator, then read the same Json.
+  then(next: fn(a) -> Decoder(b)) -> Decoder(b) {
+    Decoder(fn(value) {
+      let found = _read(value)?
+      next(found).run(value)
+    })
+  }
+
+  /// Apply a domain predicate after shape validation. Used inside field, the
+  /// containing field supplies the error path automatically.
+  check(accept: fn(a) -> Bool, expected: String) -> Decoder(a) {
+    Decoder(fn(value) {
+      let found = _read(value)?
+      match accept(found) {
+        True -> Ok(found)
+        False -> _error(value, expected)
+      }
+    })
+  }
+}
+
+/// Parse and decode an application value, preserving both failure categories.
+read(text: String, decoder: Decoder(a)) -> Result(a, ReadError) {
+  match json.decode(text) {
+    Error(error) -> Error(Syntax(error))
+    Ok(value) -> _finish(decoder.run(value))
+  }
+}
+
+/// Parse with byte/depth limits before applying the same checked recipe.
+read_with_limits(
+  text: String,
+  decoder: Decoder(a),
+  max_bytes: Int,
+  max_depth: Int
+) -> Result(a, ReadError) {
+  match json.decode_with_limits(text, max_bytes, max_depth) {
+    Error(error) -> Error(Syntax(error))
+    Ok(value) -> _finish(decoder.run(value))
+  }
+}
+
+_finish(result: Result(a, List(DecodeError))) -> Result(a, ReadError) {
+  match result {
+    Ok(value) -> Ok(value)
+    Error(errors) -> Error(Shape(errors))
+  }
+}
+
+_kind(value: json.Json) -> String {
+  match value {
+    json.JNull -> "null"
+    json.JBool(_) -> "boolean"
+    json.JInt(_) -> "integer"
+    json.JFloat(_) -> "float"
+    json.JString(_) -> "string"
+    json.JArray(_) -> "array"
+    json.JObject(_) -> "object"
+  }
+}
+
+_error(value: json.Json, expected: String) -> Result(a, List(DecodeError)) {
+  Error([DecodeError([], expected, _kind(value))])
+}
+
+_at(result: Result(a, List(DecodeError)), segment: String) -> Result(
+  a,
+  List(DecodeError)
+) {
+  match result {
+    Ok(value) -> Ok(value)
+    Error(errors) -> Error(lists.map(errors, fn(error) {
+      DecodeError([segment, ..error.path], error.expected, error.found)
+    }))
+  }
+}
+
+/// Read text; numbers and booleans are not silently rendered into strings.
+string() -> Decoder(String) {
+  Decoder(fn(value) {
+    match value {
+      json.JString(found) -> Ok(found)
+      _ -> _error(value, "string")
+    }
+  })
+}
+
+/// Read an arbitrary-precision JSON integer, preserving exactness.
+int() -> Decoder(Int) {
+  Decoder(fn(value) {
+    match value {
+      json.JInt(found) -> Ok(found)
+      _ -> _error(value, "integer")
+    }
+  })
+}
+
+/// Read a JSON float or explicitly convert an integer, as json.as_float does.
+/// Integer conversion may round; use int when exactness is required.
+float() -> Decoder(Float) {
+  Decoder(fn(value) {
+    match json.as_float(value) {
+      Some(found) -> Ok(found)
+      None -> _error(value, "representable number")
+    }
+  })
+}
+
+/// Read one of JSON's two boolean values.
+bool() -> Decoder(Bool) {
+  Decoder(fn(value) {
+    match value {
+      json.JBool(found) -> Ok(found)
+      _ -> _error(value, "boolean")
+    }
+  })
+}
+
+/// Read null as Nil. Absence and an empty array are separate values.
+null() -> Decoder(Nil) {
+  Decoder(fn(value) {
+    match value {
+      json.JNull -> Ok(Nil)
+      _ -> _error(value, "null")
+    }
+  })
+}
+
+/// Keep a Json value unchanged, useful for an application's extension fields.
+value() -> Decoder(json.Json) {
+  Decoder(fn(found) { Ok(found) })
+}
+
+/// Ignore the input and return a known checked value.
+succeed(answer: a) -> Decoder(a) {
+  Decoder(fn(_) { Ok(answer) })
+}
+
+/// Reject the input with an application-specific expectation.
+failure(expected: String) -> Decoder(a) {
+  Decoder(fn(found) { _error(found, expected) })
+}
+
+/// Read a required object field. Duplicate keys follow json.get: the first wins.
+field(name: String, decoder: Decoder(a)) -> Decoder(a) {
+  Decoder(fn(value) {
+    match value {
+      json.JObject(_) -> match json.get(value, name) {
+        None -> Error([DecodeError([name], "present field", "missing")])
+        Some(inner) -> _at(decoder.run(inner), name)
+      }
+      _ -> _error(value, "object")
+    }
+  })
+}
+
+/// Treat a missing object field as None. A present null still goes to the recipe.
+optional_field(name: String, decoder: Decoder(a)) -> Decoder(Option(a)) {
+  Decoder(fn(value) {
+    match value {
+      json.JObject(_) -> match json.get(value, name) {
+        None -> Ok(None)
+        Some(inner) -> {
+          let answer = _at(decoder.run(inner), name)?
+          Ok(Some(answer))
+        }
+      }
+      _ -> _error(value, "object")
+    }
+  })
+}
+
+/// Treat an explicit null as None, and decode every other value as Some.
+optional(decoder: Decoder(a)) -> Decoder(Option(a)) {
+  Decoder(fn(value) {
+    match value {
+      json.JNull -> Ok(None)
+      _ -> {
+        let answer = decoder.run(value)?
+        Ok(Some(answer))
+      }
+    }
+  })
+}
+
+/// Decode a zero-based array position. Negative and missing indexes return errors.
+at(index: Int, decoder: Decoder(a)) -> Decoder(a) {
+  Decoder(fn(value) {
+    match value {
+      json.JArray(_) -> match json.at(value, index) {
+        None -> Error(
+          [DecodeError([integers.to_string(index)], "array item", "missing")]
+        )
+        Some(inner) -> _at(decoder.run(inner), integers.to_string(index))
+      }
+      _ -> _error(value, "array")
+    }
+  })
+}
+
+/// Read every array item, collecting all errors in their input order.
+list(decoder: Decoder(a)) -> Decoder(List(a)) {
+  Decoder(fn(value) {
+    match value {
+      json.JArray(items) -> {
+        let #(answers, errors) = lists.index_fold(
+          items,
+          #([], []),
+          fn(acc, item, index) {
+            let #(answers, errors) = acc
+            match _at(decoder.run(item), integers.to_string(index)) {
+              Ok(answer) -> #([answer, ..answers], errors)
+              Error(found) -> #(
+                answers,
+                lists.fold(found, errors, fn(acc, error) { [error, ..acc] })
+              )
+            }
+          }
+        )
+        match errors {
+          [] -> Ok(lists.reverse(answers))
+          _ -> Error(lists.reverse(errors))
+        }
+      }
+      _ -> _error(value, "array")
+    }
+  })
+}
+
+/// Try alternatives in order, retaining their errors when all fail.
+one_of(recipes: List(Decoder(a))) -> Decoder(a) {
+  Decoder(fn(value) { _alternatives(recipes, value, []) })
+}
+
+_alternatives(
+  recipes: List(Decoder(a)),
+  value: json.Json,
+  errors: List(DecodeError)
+) -> Result(a, List(DecodeError)) {
+  match recipes {
+    [] -> match errors {
+      [] -> _error(value, "at least one alternative")
+      _ -> Error(lists.reverse(errors))
+    }
+    [head, ..tail] -> match head.run(value) {
+      Ok(answer) -> Ok(answer)
+      Error(found) -> _alternatives(
+        tail,
+        value,
+        lists.fold(found, errors, fn(acc, error) { [error, ..acc] })
+      )
+    }
+  }
+}
+
+/// Read two fields or positions from one input, then construct a checked value.
+map2(first: Decoder(a), second: Decoder(b), combine: fn(a, b) -> c) -> Decoder(
+  c
+) {
+  Decoder(fn(value) {
+    let a = first.run(value)?
+    let b = second.run(value)?
+    Ok(combine(a, b))
+  })
+}
+
+/// Read three components. Stop at the first failing component.
+map3(
+  first: Decoder(a),
+  second: Decoder(b),
+  third: Decoder(c),
+  combine: fn(a, b, c) -> d
+) -> Decoder(d) {
+  Decoder(fn(value) {
+    let a = first.run(value)?
+    let b = second.run(value)?
+    let c = third.run(value)?
+    Ok(combine(a, b, c))
+  })
+}
+
+/// Delay building a recipe until it sees a value, allowing recursive structures.
+lazy(build: fn() -> Decoder(a)) -> Decoder(a) {
+  Decoder(fn(value) { build().run(value) })
+}
+
+/// Describe structured errors using escaped JSON-pointer segments after $.
+describe(error: ReadError) -> String {
+  match error {
+    Syntax(problem) -> json.describe(problem)
+    Shape(errors) -> lists.map(errors, fn(error) {
+      let address = lists.fold(error.path, "$", fn(acc, part) {
+        acc + "/" + strings.replace(strings.replace(part, "~", "~0"), "/", "~1")
+      })
+      address + ": expected " + error.expected + ", found " + error.found
+    }) |> strings.join("\n")
+  }
+}

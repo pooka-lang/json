@@ -1,0 +1,401 @@
+//// Read and write JSON, with Erlang's own `json` module doing the heavy
+//// lifting.
+////
+//// A JSON document becomes a `Json` value: one of seven small classes, one
+//// for each kind of thing JSON can say. Take it apart with `match`, or with
+//// the helpers at the end of this module.
+////
+//// ```pooka
+//// import pooka/json
+////
+//// main() {
+////   let assert Ok(owl) = json.decode("{\"name\": \"Ada\", \"age\": 3}")
+////   echo json.get(owl, "name")
+////   echo json.encode(json.JArray([json.JInt(1), json.JNull()]))
+//// }
+//// ```
+////
+//// Objects keep their entries in the order they were written, so a document
+//// that is decoded and encoded again comes back in the same order.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module json
+
+import pooka/int
+import pooka/list
+
+/// Any JSON value.
+class Json {}
+
+/// `null`
+class JNull is Json {}
+
+/// `true` or `false`
+class JBool(value: Bool) is Json
+
+/// A number written without a fraction or exponent, such as `42`.
+class JInt(value: Int) is Json
+
+/// A number written with a fraction or exponent, such as `2.5` or `1e3`.
+class JFloat(value: Float) is Json
+
+/// A string, with its escapes already resolved.
+class JString(value: String) is Json
+
+/// An array.
+class JArray(items: List(Json)) is Json
+
+/// An object, as its entries in the order they were written. A key that
+/// appears twice is kept twice; `get` returns the first.
+class JObject(entries: List(#(String, Json))) is Json
+
+/// A promise an application value can make without joining Json's closed family.
+/// The class chooses its JSON shape; the ordinary writers handle the text.
+///
+/// ```pooka
+/// import pooka/json
+/// import pooka/json.{Encodable}
+///
+/// class Bird(name: String) with Encodable {
+///   to_json() -> json.Json {
+///     json.JObject([#("name", json.JString(name))])
+///   }
+/// }
+///
+/// assert json.encode_value(Bird("Ada")) == "{\"name\":\"Ada\"}"
+/// ```
+interface Encodable {
+  /// Return the JSON representation. The writer calls this method once.
+  to_json() -> Json
+}
+
+/// Why a text is not JSON.
+class JsonError {}
+
+/// The text stopped in the middle of a value.
+class UnexpectedEnd is JsonError {}
+
+/// A byte that cannot appear where it was found, as its numeric value.
+class InvalidByte(byte: Int) is JsonError
+
+/// A broken escape or invalid UTF-8 inside a string.
+class UnexpectedSequence(text: String) is JsonError
+
+/// A syntactically valid number whose magnitude is outside the BEAM Float range.
+class NumberOutOfRange(text: String) is JsonError
+
+/// An input byte or nesting limit was exceeded before building the value tree.
+class LimitExceeded(limit: String) is JsonError
+
+external _Ffi from erlang "pooka_json_ffi" {
+  decode(text: String) -> Result(Json, JsonError)
+
+  decode_limited(text: String, max_bytes: Int, max_depth: Int) -> Result(
+    Json,
+    JsonError
+  )
+
+  encode_string(text: String) -> String
+
+  encode_float(value: Float) -> String
+
+  join(pieces: List(String)) -> String
+}
+
+/// Read one JSON document.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// assert json.decode("[1, true]") == Ok(json.JArray([json.JInt(1), json.JBool(True)]))
+/// assert json.decode("[1,") == Error(json.UnexpectedEnd())
+/// ```
+decode(text: String) -> Result(Json, JsonError) {
+  _Ffi.decode(text)
+}
+
+/// A sentence for the person who wrote the text.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// assert json.describe(json.UnexpectedEnd()) == "the JSON text ended too early"
+/// ```
+describe(problem: JsonError) -> String {
+  match problem {
+    UnexpectedEnd -> "the JSON text ended too early"
+    InvalidByte(byte) -> "unexpected byte " + int.to_string(byte) + " in the JSON text"
+    UnexpectedSequence(text) -> "invalid sequence in a JSON string: " + text
+    NumberOutOfRange(text) -> "JSON number is outside the Float range: " + text
+    LimitExceeded(limit) -> "JSON input exceeded the " + limit + " limit"
+  }
+}
+
+/// Write a value as compact JSON, with no spaces.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// let owl = json.JObject([#("name", json.JString("Ada")), #("age", json.JInt(3))])
+/// assert json.encode(owl) == "{\"name\":\"Ada\",\"age\":3}"
+/// ```
+encode(value: Json) -> String {
+  _emit(value, []) |> _Ffi.join()
+}
+
+/// Write a value as JSON for people, indented by two spaces.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// assert json.encode_pretty(json.JArray([json.JInt(1), json.JInt(2)])) == "[\n  1,\n  2\n]"
+/// ```
+encode_pretty(value: Json) -> String {
+  _pretty(value, "\n", []) |> _Ffi.join()
+}
+
+/// Write an application value through its Encodable promise, as compact JSON.
+/// Existing Json values continue to use encode directly.
+///
+/// ```pooka
+/// // With the Bird class from Encodable's example:
+/// assert json.encode_value(Bird("Ada")) == "{\"name\":\"Ada\"}"
+/// ```
+encode_value(value: Encodable) -> String {
+  value.to_json() |> encode()
+}
+
+/// Write an application value through Encodable, indented by two spaces.
+///
+/// ```pooka
+/// // With the Bird class from Encodable's example:
+/// assert json.encode_value_pretty(Bird("Ada")) == "{\n  \"name\": \"Ada\"\n}"
+/// ```
+encode_value_pretty(value: Encodable) -> String {
+  value.to_json() |> encode_pretty()
+}
+
+// --- helpers ------------------------------------------------------------------
+
+/// The value under a key, if this is an object that has it.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// let assert Ok(owl) = json.decode("{\"name\": \"Ada\"}")
+/// assert json.get(owl, "name") == Some(json.JString("Ada"))
+/// assert json.get(owl, "wings") == None
+/// ```
+get(value: Json, key: String) -> Option(Json) {
+  match value {
+    JObject(entries) -> _lookup(entries, key)
+    _ -> None
+  }
+}
+
+/// Follow several keys, one object inside another.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// let assert Ok(nest) = json.decode("{\"owl\": {\"name\": \"Ada\"}}")
+/// assert json.path(nest, ["owl", "name"]) == Some(json.JString("Ada"))
+/// ```
+path(value: Json, keys: List(String)) -> Option(Json) {
+  match keys {
+    [] -> Some(value)
+    [key, ..rest] -> match get(value, key) {
+      Some(inner) -> path(inner, rest)
+      None -> None
+    }
+  }
+}
+
+/// The item at a position, counting from zero, if this is an array that has it.
+///
+/// ```pooka
+/// import pooka/json
+///
+/// let assert Ok(row) = json.decode("[10, 20]")
+/// assert json.at(row, 1) == Some(json.JInt(20))
+/// ```
+at(value: Json, index: Int) -> Option(Json) {
+  match value {
+    JArray(items) -> list.at(items, index)
+    _ -> None
+  }
+}
+
+/// The text, if this is a string.
+as_string(value: Json) -> Option(String) {
+  match value {
+    JString(text) -> Some(text)
+    _ -> None
+  }
+}
+
+/// The number, if this is a whole number.
+as_int(value: Json) -> Option(Int) {
+  match value {
+    JInt(number) -> Some(number)
+    _ -> None
+  }
+}
+
+/// The number as a Float. JSON does not tell `3` from `3.0`, so both are
+/// accepted here.
+as_float(value: Json) -> Option(Float) {
+  match value {
+    JFloat(number) -> Some(number)
+    JInt(number) -> match int.to_float(number) {
+      Ok(float) -> Some(float)
+      Error(_) -> None
+    }
+    _ -> None
+  }
+}
+
+/// The truth value, if this is `true` or `false`.
+as_bool(value: Json) -> Option(Bool) {
+  match value {
+    JBool(truth) -> Some(truth)
+    _ -> None
+  }
+}
+
+/// The items, if this is an array.
+as_list(value: Json) -> Option(List(Json)) {
+  match value {
+    JArray(items) -> Some(items)
+    _ -> None
+  }
+}
+
+/// The entries, if this is an object.
+as_entries(value: Json) -> Option(List(#(String, Json))) {
+  match value {
+    JObject(entries) -> Some(entries)
+    _ -> None
+  }
+}
+
+/// Is this `null`?
+is_null(value: Json) -> Bool {
+  value == JNull()
+}
+
+// --- writing ------------------------------------------------------------------
+
+// Pieces are collected newest first and glued once at the end.
+_emit(value: Json, out: List(String)) -> List(String) {
+  match value {
+    JNull -> ["null", ..out]
+    JBool(True) -> ["true", ..out]
+    JBool(False) -> ["false", ..out]
+    JInt(number) -> [int.to_string(number), ..out]
+    JFloat(number) -> [_Ffi.encode_float(number), ..out]
+    JString(text) -> [_Ffi.encode_string(text), ..out]
+    JArray([]) -> ["[]", ..out]
+    JArray([first, ..rest]) -> [
+      "]",
+      .._emit_items(rest, _emit(first, ["[", ..out]))
+    ]
+    JObject([]) -> ["{}", ..out]
+    JObject([first, ..rest]) -> [
+      "}",
+      .._emit_entries(rest, _emit_entry(first, ["{", ..out]))
+    ]
+  }
+}
+
+_emit_items(items: List(Json), out: List(String)) -> List(String) {
+  match items {
+    [] -> out
+    [item, ..rest] -> _emit_items(rest, _emit(item, [",", ..out]))
+  }
+}
+
+_emit_entry(entry: #(String, Json), out: List(String)) -> List(String) {
+  let #(key, value) = entry
+  _emit(value, [":", _Ffi.encode_string(key), ..out])
+}
+
+_emit_entries(entries: List(#(String, Json)), out: List(String)) -> List(String) {
+  match entries {
+    [] -> out
+    [entry, ..rest] -> _emit_entries(rest, _emit_entry(entry, [",", ..out]))
+  }
+}
+
+// `gap` is a newline followed by the current indentation.
+_pretty(value: Json, gap: String, out: List(String)) -> List(String) {
+  let inner = gap + "  "
+  match value {
+    JArray([first, ..rest]) -> {
+      let opened = _pretty(first, inner, ["[" + inner, ..out])
+      [gap + "]", .._pretty_items(rest, inner, opened)]
+    }
+    JObject([first, ..rest]) -> {
+      let opened = _pretty_entry(first, inner, ["{" + inner, ..out])
+      [gap + "}", .._pretty_entries(rest, inner, opened)]
+    }
+    _ -> _emit(value, out)
+  }
+}
+
+_pretty_items(items: List(Json), gap: String, out: List(String)) -> List(String) {
+  match items {
+    [] -> out
+    [item, ..rest] -> _pretty_items(
+      rest,
+      gap,
+      _pretty(item, gap, ["," + gap, ..out])
+    )
+  }
+}
+
+_pretty_entry(entry: #(String, Json), gap: String, out: List(String)) -> List(
+  String
+) {
+  let #(key, value) = entry
+  _pretty(value, gap, [": ", _Ffi.encode_string(key), ..out])
+}
+
+_pretty_entries(
+  entries: List(#(String, Json)),
+  gap: String,
+  out: List(String)
+) -> List(String) {
+  match entries {
+    [] -> out
+    [entry, ..rest] -> _pretty_entries(
+      rest,
+      gap,
+      _pretty_entry(entry, gap, ["," + gap, ..out])
+    )
+  }
+}
+
+_lookup(entries: List(#(String, Json)), key: String) -> Option(Json) {
+  match entries {
+    [] -> None
+    [#(name, value), ..rest] -> match name == key {
+      True -> Some(value)
+      False -> _lookup(rest, key)
+    }
+  }
+}
+
+/// Parse untrusted input with explicit byte and container-depth budgets.
+/// A scalar has depth zero. A negative budget rejects every input.
+///
+/// ```pooka
+/// assert json.decode_with_limits("[[1]]", 100, 1) == Error(json.LimitExceeded("depth"))
+/// ```
+decode_with_limits(text: String, max_bytes: Int, max_depth: Int) -> Result(
+  Json,
+  JsonError
+) {
+  _Ffi.decode_limited(text, max_bytes, max_depth)
+}
