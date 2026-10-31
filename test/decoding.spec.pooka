@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A shape error keeps its address, even inside a list of nested records.
+
+module decoding_test
+
+import pooka/json
+import pooka/json/decode
+import pooka/list
+import pooka/string
+
+class Person(name: String, age: Int)
+
+person() -> decode.Decoder(Person) {
+  decode.map2(
+    decode.field("name", decode.string()),
+    decode.field("age", decode.int()),
+    Person
+  )
+}
+
+test "decoders build typed application records" {
+  assert decode.read("{\"name\":\"Ada\",\"age\":3}", person()) == Ok(
+    Person("Ada", 3)
+  )
+  assert decode.read("[1,2]", decode.list(decode.int())) == Ok([1, 2])
+  assert decode.read("true", decode.bool()) == Ok(True)
+  assert decode.read("null", decode.null()) == Ok(Nil)
+  assert decode.read("3", decode.float()) == Ok(3.0)
+  assert decode.read("3.5", decode.float()) == Ok(3.5)
+}
+
+test "syntax and shape failures remain distinct" {
+  assert decode.read("[", person()) == Error(
+    decode.Syntax(json.UnexpectedEnd())
+  )
+  assert decode.read("3", decode.string()) == Error(
+    decode.Shape([decode.DecodeError([], "string", "integer")])
+  )
+  assert decode.read("3.5", decode.int()) == Error(
+    decode.Shape([decode.DecodeError([], "integer", "float")])
+  )
+}
+
+test "field failures retain complete list and record paths" {
+  let recipe = decode.field("people", decode.list(person()))
+  let assert Error(decode.Shape(errors)) = decode.read(
+    "{\"people\":[{\"name\":\"Ada\",\"age\":\"old\"},{\"name\":false,\"age\":2}]}",
+    recipe
+  )
+  assert errors == [
+    decode.DecodeError(["people", "0", "age"], "integer", "string"),
+    decode.DecodeError(["people", "1", "name"], "string", "boolean")
+  ]
+}
+
+test "missing and null fields are different" {
+  assert decode.read("{}", decode.optional_field("name", decode.string())) == Ok(
+    None
+  )
+  let assert Error(_) = decode.read(
+    "{\"name\":null}",
+    decode.optional_field("name", decode.string())
+  )
+  assert decode.read(
+    "{\"name\":null}",
+    decode.field("name", decode.optional(decode.string()))
+  ) == Ok(None)
+  assert decode.read(
+    "{\"name\":\"Ada\"}",
+    decode.optional_field("name", decode.string())
+  ) == Ok(Some("Ada"))
+  let assert Error(_) = decode.read(
+    "null",
+    decode.optional_field("name", decode.string())
+  )
+}
+
+test "duplicate field policy stays first wins" {
+  assert decode.read("{\"age\":1,\"age\":2}", decode.field("age", decode.int())) == Ok(
+    1
+  )
+  let assert Error(_) = decode.read(
+    "{\"age\":\"bad\",\"age\":2}",
+    decode.field("age", decode.int())
+  )
+}
+
+test "array positions and empty lists report their own shapes" {
+  assert decode.read("[3,\"owl\"]", decode.at(1, decode.string())) == Ok("owl")
+  assert decode.read("[]", decode.list(decode.int())) == Ok([])
+  let assert Error(_) = decode.read("[]", decode.at(0, decode.int()))
+  let assert Error(_) = decode.read("[3]", decode.at(-1, decode.int()))
+  let assert Error(_) = decode.read("{}", decode.at(0, decode.int()))
+}
+
+test "domain checks inherit their field path" {
+  let age = decode.int().check(fn(n) { n >= 0 }, "nonnegative age")
+  assert decode.read("{\"age\":7}", decode.field("age", age)) == Ok(7)
+  assert decode.read("{\"age\":-1}", decode.field("age", age)) == Error(
+    decode.Shape([decode.DecodeError(["age"], "nonnegative age", "integer")])
+  )
+}
+
+test "alternatives retain errors and support checked mapping" {
+  let recipe = decode.one_of([decode.string(), decode.int().map(fn(_) {
+    "number"
+  })])
+  assert decode.read("3", recipe) == Ok("number")
+  assert decode.read("\"owl\"", recipe) == Ok("owl")
+  let assert Error(decode.Shape(errors)) = decode.read("false", recipe)
+  assert list.length(errors) == 2
+  let assert Error(_) = decode.read("false", decode.one_of([]))
+}
+
+test "then selects a recipe using a typed discriminator" {
+  let recipe = decode.field("kind", decode.string()).then(fn(kind) {
+    match kind {
+      "age" -> decode.field("value", decode.int())
+      _ -> decode.failure("age kind")
+    }
+  })
+  assert decode.read("{\"kind\":\"age\",\"value\":7}", recipe) == Ok(7)
+  let assert Error(_) = decode.read("{\"kind\":\"wrong\",\"value\":7}", recipe)
+}
+
+class Branch(value: Int, children: List(Branch))
+
+branch() -> decode.Decoder(Branch) {
+  decode.map2(
+    decode.field("value", decode.int()),
+    decode.field("children", decode.list(decode.lazy(branch))),
+    Branch
+  )
+}
+
+test "recursive recipes are built only as the input is visited" {
+  assert decode.read(
+    "{\"value\":1,\"children\":[{\"value\":2,\"children\":[]}]}",
+    branch()
+  ) == Ok(Branch(1, [Branch(2, [])]))
+  let assert Error(decode.Shape(errors)) = decode.read(
+    "{\"value\":1,\"children\":[{\"value\":false,\"children\":[]}]}",
+    branch()
+  )
+  assert errors == [
+    decode.DecodeError(["children", "0", "value"], "integer", "boolean")
+  ]
+}
+
+test "three components can construct a checked tuple" {
+  let recipe = decode.map3(
+    decode.at(0, decode.int()),
+    decode.at(1, decode.bool()),
+    decode.at(2, decode.string()),
+    fn(a, b, c) { #(a, b, c) }
+  )
+  assert decode.read("[3,true,\"owl\"]", recipe) == Ok(#(3, True, "owl"))
+  assert decode.read("null", decode.succeed(7)) == Ok(7)
+  assert decode.read("null", decode.value()) == Ok(json.JNull())
+}
+
+test "error descriptions escape pointer segments" {
+  let error = decode.Shape(
+    [decode.DecodeError(["a/b~c", "0"], "integer", "string")]
+  )
+  assert decode.describe(error) == "$/a~1b~0c/0: expected integer, found string"
+  assert decode.describe(decode.Syntax(json.UnexpectedEnd())) == json.describe(
+    json.UnexpectedEnd()
+  )
+}
+
+test "bounded decoding limits bytes and container depth" {
+  assert json.decode_with_limits("[1]", 3, 1) == json.decode("[1]")
+  assert json.decode_with_limits("[1]", 2, 1) == Error(
+    json.LimitExceeded("byte")
+  )
+  assert json.decode_with_limits("[[1]]", 100, 1) == Error(
+    json.LimitExceeded("depth")
+  )
+  assert json.decode_with_limits("[]", 100, 0) == Error(
+    json.LimitExceeded("depth")
+  )
+  assert json.decode_with_limits("3", 1, 0) == Ok(json.JInt(3))
+  assert json.decode_with_limits("3", -1, 0) == Error(
+    json.LimitExceeded("byte")
+  )
+  assert json.decode_with_limits("3", 1, -1) == Error(
+    json.LimitExceeded("depth")
+  )
+  assert json.decode_with_limits("\"[{}]\\\"\"", 100, 0) == json.decode(
+    "\"[{}]\\\"\""
+  )
+  assert decode.read_with_limits("[3]", decode.list(decode.int()), 2, 1) == Error(
+    decode.Syntax(json.LimitExceeded("byte"))
+  )
+}
+
+test "out of range numeric errors are not described as string failures" {
+  let assert Error(json.NumberOutOfRange(text)) = json.decode("1e400")
+  assert string.contains(text, "400")
+  assert string.contains(
+    json.describe(json.NumberOutOfRange(text)),
+    "Float range"
+  )
+  let assert Error(json.NumberOutOfRange(_)) = json.decode("-1e400")
+}
+
+test "optimised writers preserve order duplicates and escapes" {
+  let values = list.map(list.range(0, 1000), fn(n) {
+    json.JObject([#("a", json.JInt(n)), #("a", json.JString("é🐇\\\"\n"))])
+  })
+  let value = json.JArray(values)
+  assert json.decode(json.encode(value)) == Ok(value)
+  assert json.decode(json.encode_pretty(value)) == Ok(value)
+}

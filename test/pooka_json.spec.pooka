@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module pooka_json_test
+
+import pooka/json
+import pooka/list
+
+_decode(text: String) -> json.Json {
+  let assert Ok(value) = json.decode(text)
+  value
+}
+
+test "the seven kinds of value" {
+  assert _decode("null") == json.JNull()
+  assert _decode("true") == json.JBool(True)
+  assert _decode("false") == json.JBool(False)
+  assert _decode("42") == json.JInt(42)
+  assert _decode("-7") == json.JInt(-7)
+  assert _decode("2.5") == json.JFloat(2.5)
+  assert _decode("1e3") == json.JFloat(1000.0)
+  assert _decode("\"owl\"") == json.JString("owl")
+  assert _decode("[]") == json.JArray([])
+  assert _decode("{}") == json.JObject([])
+}
+
+test "whole numbers stay whole, however large" {
+  assert _decode("123456789012345678901234567890") == json.JInt(
+    123456789012345678901234567890
+  )
+}
+
+test "nested values" {
+  assert _decode("{\"name\": \"Ada\", \"tags\": [1, null, {\"deep\": true}]}") == json.JObject(
+    [
+      #("name", json.JString("Ada")),
+      #(
+        "tags",
+        json.JArray(
+          [
+            json.JInt(1),
+            json.JNull(),
+            json.JObject([#("deep", json.JBool(True))])
+          ]
+        )
+      )
+    ]
+  )
+}
+
+test "whitespace around a document is ignored" {
+  assert _decode(" \n\t[ 1 , 2 ]\r\n ") == json.JArray(
+    [json.JInt(1), json.JInt(2)]
+  )
+}
+
+test "string escapes are resolved" {
+  assert _decode("\"a\\n\\\"b\\\"\\u00e9\\ud83e\\udd89\"") == json.JString(
+    "a\n\"b\"é🦉"
+  )
+}
+
+test "object entries keep their order, and repeated keys" {
+  let value = _decode("{\"b\": 1, \"a\": 2, \"b\": 3}")
+  assert json.as_entries(value) == Some(
+    [#("b", json.JInt(1)), #("a", json.JInt(2)), #("b", json.JInt(3))]
+  )
+  assert json.get(value, "b") == Some(json.JInt(1))
+}
+
+test "text that is not JSON is refused" {
+  assert json.decode("") == Error(json.UnexpectedEnd())
+  assert json.decode("[1,") == Error(json.UnexpectedEnd())
+  assert json.decode("{\"a\"") == Error(json.UnexpectedEnd())
+  assert json.decode("[1,x]") == Error(json.InvalidByte(120))
+  assert json.decode("nul") == Error(json.UnexpectedEnd())
+  assert json.decode("[1] 2") == Error(json.InvalidByte(50))
+  assert json.decode("'single'") == Error(json.InvalidByte(39))
+}
+
+test "a broken escape is refused" {
+  assert json.decode("\"\\uZZZZ\"") == Error(
+    json.UnexpectedSequence("\\uZZZZ")
+  )
+}
+
+test "errors can be described" {
+  assert json.describe(json.UnexpectedEnd()) == "the JSON text ended too early"
+  assert json.describe(json.InvalidByte(120)) == "unexpected byte 120 in the JSON text"
+}
+
+test "values are written compactly" {
+  assert json.encode(json.JNull()) == "null"
+  assert json.encode(json.JBool(True)) == "true"
+  assert json.encode(json.JBool(False)) == "false"
+  assert json.encode(json.JInt(-12)) == "-12"
+  assert json.encode(json.JFloat(2.5)) == "2.5"
+  assert json.encode(json.JFloat(1.0e100)) == "1.0e100"
+  assert json.encode(json.JString("owl")) == "\"owl\""
+  assert json.encode(json.JArray([])) == "[]"
+  assert json.encode(json.JObject([])) == "{}"
+  assert json.encode(json.JArray([json.JInt(1), json.JNull()])) == "[1,null]"
+  assert json.encode(
+    json.JObject(
+      [#("a", json.JInt(1)), #("b", json.JArray([json.JBool(True)]))]
+    )
+  ) == "{\"a\":1,\"b\":[true]}"
+}
+
+test "strings are escaped when written" {
+  assert json.encode(json.JString("a\n\"b\"\\ é🦉")) == "\"a\\n\\\"b\\\"\\\\ é🦉\""
+  assert json.encode(json.JObject([#("a\"b", json.JNull())])) == "{\"a\\\"b\":null}"
+}
+
+test "a document survives a round trip" {
+  let text = "{\"name\":\"Ada\",\"age\":3,\"weight\":1.25,\"tags\":[\"night\",\"quiet\"],\"nest\":{\"tree\":\"oak\",\"empty\":[],\"none\":null}}"
+  assert json.encode(_decode(text)) == text
+}
+
+test "values are written for people" {
+  let value = _decode(
+    "{\"name\":\"Ada\",\"tags\":[1,2],\"empty\":[],\"nest\":{\"a\":null}}"
+  )
+  assert json.encode_pretty(value) == "{\n  \"name\": \"Ada\",\n  \"tags\": [\n    1,\n    2\n  ],\n  \"empty\": [],\n  \"nest\": {\n    \"a\": null\n  }\n}"
+  assert _decode(json.encode_pretty(value)) == value
+}
+
+test "looking inside" {
+  let value = _decode(
+    "{\"owl\": {\"name\": \"Ada\", \"ages\": [3, 4.5]}, \"awake\": true, \"gone\": null}"
+  )
+  assert json.path(value, ["owl", "name"]) == Some(json.JString("Ada"))
+  assert json.path(value, ["owl", "wings"]) == None
+  assert json.path(value, []) == Some(value)
+  let assert Some(ages) = json.path(value, ["owl", "ages"])
+  assert json.at(ages, 0) == Some(json.JInt(3))
+  assert json.at(ages, 2) == None
+  assert json.at(value, 0) == None
+  assert json.get(ages, "name") == None
+}
+
+test "reading values out" {
+  assert json.as_string(json.JString("owl")) == Some("owl")
+  assert json.as_string(json.JInt(1)) == None
+  assert json.as_int(json.JInt(3)) == Some(3)
+  assert json.as_int(json.JFloat(3.0)) == None
+  assert json.as_float(json.JFloat(2.5)) == Some(2.5)
+  assert json.as_float(json.JInt(3)) == Some(3.0)
+  assert json.as_bool(json.JBool(False)) == Some(False)
+  assert json.as_list(json.JArray([json.JNull()])) == Some([json.JNull()])
+  assert json.as_entries(json.JNull()) == None
+  assert json.is_null(json.JNull())
+  assert !json.is_null(json.JBool(False))
+}
+
+// Application classes live outside the closed Json family. The interface is
+// their open door: each class chooses a shape and leaves text escaping to JSON.
+class Bird(name: String, age: Int) with json.Encodable {
+  to_json() -> json.Json {
+    json.JObject([#("name", json.JString(name)), #("age", json.JInt(age))])
+  }
+}
+
+class Empty with json.Encodable {
+  to_json() -> json.Json {
+    json.JNull()
+  }
+}
+
+class Readings(values: List(Int)) with json.Encodable {
+  to_json() -> json.Json {
+    json.JArray(_json_readings(values))
+  }
+}
+
+_json_readings(values: List(Int)) -> List(json.Json) {
+  match values {
+    [] -> []
+    [head, ..tail] -> list.prepend(_json_readings(tail), json.JInt(head))
+  }
+}
+
+test "application classes encode through an imported interface" {
+  assert json.encode_value(Bird("Ada", 3)) == "{\"name\":\"Ada\",\"age\":3}"
+  assert json.encode_value(Empty()) == "null"
+  assert json.encode_value(Readings([1, 2, 3])) == "[1,2,3]"
+}
+
+test "interface encoding uses the ordinary escaping and pretty writer" {
+  let bird = Bird("a\n\"🦉\"", 2)
+  assert _decode(json.encode_value(bird)) == bird.to_json()
+  assert _decode(json.encode_value_pretty(bird)) == bird.to_json()
+  assert json.encode_value_pretty(Empty()) == "null"
+  assert json.encode_value_pretty(Readings([])) == "[]"
+  assert json.encode_value_pretty(Readings([1, 2])) == "[\n  1,\n  2\n]"
+}
