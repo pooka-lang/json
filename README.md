@@ -19,7 +19,7 @@ assert decode.read("{\"count\":3}", count) == Ok(3)
 
 Parsing uses Erlang’s native JSON parser. Objects preserve order and duplicate keys; field lookup uses the first occurrence. `pooka/json/decode` checks the typed JSON tree and reports field paths. Use bounded decoding for untrusted input.
 
-See the [API documentation](https://pooka-json.hexdocs.pm/) for the rest. Built for [Pooka](https://pooka.run) and Erlang/OTP 29.
+See the [API documentation](https://pooka-json.hexdocs.pm/) for the rest.
 
 ## Licence
 
