@@ -11,10 +11,14 @@ pooka add pooka_json
 ```
 
 ```pooka
+module main
+
 import pooka/json/decode
 
-let count = decode.field("count", decode.int())
-assert decode.read("{\"count\":3}", count) == Ok(3)
+main() {
+  let count = decode.field("count", decode.int())
+  assert decode.read("{\"count\":3}", count) == Ok(3)
+}
 ```
 
 Parsing uses Erlang’s native JSON parser. Objects preserve order and duplicate keys; field lookup uses the first occurrence. `pooka/json/decode` checks the typed JSON tree and reports field paths. Use bounded decoding for untrusted input.
